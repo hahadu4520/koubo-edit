@@ -8,9 +8,18 @@
   python koubo.py burn <workdir> [--en]         # burn everything -> <id>_成片.mp4 (or _成片_双语.mp4)
   python koubo.py cover <workdir>               # 3:4 covers from config.covers -> <id>_封面/
 
-Run with the skill venv (pillow + jieba): ~/.claude/skills/koubo-edit/venv/bin/python
+Works on macOS and Windows. Any python can launch it: it re-runs itself inside the skill's venv
+(created by install.sh / install.ps1).
 """
-import json, math, os, re, subprocess, sys, array, wave
+import json, math, os, platform, re, shutil, subprocess, sys, array, wave
+
+SKILL = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_VPY = os.path.join(SKILL, "venv", "Scripts", "python.exe") if os.name == "nt" else os.path.join(SKILL, "venv", "bin", "python")
+if os.path.exists(_VPY) and os.path.realpath(sys.prefix) != os.path.realpath(os.path.join(SKILL, "venv")):
+    sys.exit(subprocess.run([_VPY, os.path.abspath(__file__)] + sys.argv[1:]).returncode)
+for _s in (sys.stdout, sys.stderr):
+    try: _s.reconfigure(encoding="utf-8", errors="replace")
+    except Exception: pass
 from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageEnhance
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -26,7 +35,7 @@ def sh(*cmd):
 
 
 def load(wd):
-    cfg = json.load(open(os.path.join(wd, "config.json")))
+    cfg = json.load(open(os.path.join(wd, "config.json"), encoding="utf-8"))
     cfg["src"] = os.path.expanduser(cfg["src"])
     cfg.setdefault("id", os.path.splitext(os.path.basename(cfg["src"]))[0].replace("_raw", ""))
     cfg["out_dir"] = os.path.expanduser(cfg.get("out_dir", os.path.dirname(cfg["src"])))
@@ -45,16 +54,52 @@ def duration(path):
 
 def transcribe(video, out_json):
     if os.path.exists(out_json):
-        return json.load(open(out_json))
+        return json.load(open(out_json, encoding="utf-8"))
     d = os.path.dirname(out_json)
     wav = os.path.join(d, os.path.basename(out_json)[:-5] + ".wav")
     sh("ffmpeg", "-y", "-v", "error", "-i", video, "-vn", "-ac", "1", "-ar", "16000", wav)
-    mw = os.path.join(os.path.dirname(sys.executable), "mlx_whisper")
-    sh(mw if os.path.exists(mw) else "mlx_whisper", wav, "--model", "mlx-community/whisper-large-v3-turbo", "--language", "zh",
-       "--word-timestamps", "True", "--output-format", "json", "--output-dir", d,
-       "--initial-prompt", "以下是普通话的口播，使用简体中文。")
-    os.replace(os.path.join(d, os.path.basename(wav)[:-4] + ".json"), out_json)
-    return json.load(open(out_json))
+    prompt = "以下是普通话的口播，使用简体中文。"
+    if asr_backend() == "mlx":
+        mw = os.path.join(os.path.dirname(sys.executable), "mlx_whisper")
+        sh(mw if os.path.exists(mw) else "mlx_whisper", wav, "--model", "mlx-community/whisper-large-v3-turbo", "--language", "zh",
+           "--word-timestamps", "True", "--output-format", "json", "--output-dir", d, "--initial-prompt", prompt)
+        os.replace(os.path.join(d, os.path.basename(wav)[:-4] + ".json"), out_json)
+    else:  # Windows / Intel Mac / Linux: faster-whisper, same JSON shape as mlx_whisper
+        from faster_whisper import WhisperModel
+        model = WhisperModel("large-v3-turbo", device="auto", compute_type="default")
+        segs, _ = model.transcribe(wav, language="zh", word_timestamps=True, initial_prompt=prompt)
+        out = {"segments": [{"start": s.start, "end": s.end, "text": s.text,
+                             "words": [{"word": w.word, "start": w.start, "end": w.end} for w in (s.words or [])]} for s in segs]}
+        json.dump(out, open(out_json, "w", encoding="utf-8"), ensure_ascii=False)
+    return json.load(open(out_json, encoding="utf-8"))
+
+
+def asr_backend():
+    if os.environ.get("KOUBO_ASR") in ("mlx", "faster"):
+        return os.environ["KOUBO_ASR"]
+    if sys.platform == "darwin" and platform.machine() == "arm64":
+        try:
+            import mlx_whisper  # noqa: F401
+            return "mlx"
+        except ImportError:
+            if shutil.which("mlx_whisper"): return "mlx"
+    return "faster"
+
+
+_VENC = None
+def venc():
+    """Hardware H.264 where available (VideoToolbox on Mac, NVENC on NVIDIA), else libx264."""
+    global _VENC
+    if _VENC is None:
+        encs = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"], capture_output=True, text=True).stdout
+        if sys.platform == "darwin" and "h264_videotoolbox" in encs:
+            _VENC = ["-c:v", "h264_videotoolbox", "-b:v", "14M"]
+        elif "h264_nvenc" in encs and subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "color=s=256x256:d=0.1",
+                                                      "-c:v", "h264_nvenc", "-f", "null", "-"]).returncode == 0:
+            _VENC = ["-c:v", "h264_nvenc", "-b:v", "14M"]
+        else:
+            _VENC = ["-c:v", "libx264", "-crf", "18", "-preset", "medium"]
+    return _VENC
 
 
 def silences(video, noise=-35, dur=0.35):
@@ -72,7 +117,7 @@ def silences(video, noise=-35, dur=0.35):
 def cmd_roughcut(wd, *flags):
     cfg = load(wd); src = cfg["src"]; DUR = duration(src)
     raw = transcribe(src, os.path.join(wd, "raw.json"))
-    with open(os.path.join(wd, "raw_transcript.txt"), "w") as f:
+    with open(os.path.join(wd, "raw_transcript.txt"), "w", encoding="utf-8") as f:
         for i, s in enumerate(raw["segments"]):
             f.write("%d %.2f-%.2f %s\n" % (i, s["start"], s["end"], s["text"]))
     keep_pre, keep_post = cfg.get("pause_keep", [0.12, 0.10])
@@ -105,12 +150,12 @@ def cmd_roughcut(wd, *flags):
         fg.append(f"[0:v]trim={a:.3f}:{b:.3f},setpts=PTS-STARTPTS[v{i}];[0:a]atrim={a:.3f}:{b:.3f},asetpts=PTS-STARTPTS,"
                   f"afade=t=in:d=0.01,afade=t=out:st={max(0, b - a - 0.015):.3f}:d=0.015[a{i}]")
     fg.append("".join(f"[v{i}][a{i}]" for i in range(len(keep))) + f"concat=n={len(keep)}:v=1:a=1[v][a]")
-    fgp = os.path.join(wd, "roughcut_filter.txt"); open(fgp, "w").write(";\n".join(fg))
+    fgp = os.path.join(wd, "roughcut_filter.txt"); open(fgp, "w", encoding="utf-8").write(";\n".join(fg))
     out = outp(cfg, "_粗剪.mp4")
     if "--dry" not in flags: sh("ffmpeg", "-y", "-v", "error", "-i", src, "-filter_complex_script", fgp, "-map", "[v]", "-map", "[a]",
-       "-r", "30", "-c:v", "h264_videotoolbox", "-b:v", "14M", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", out)
+       "-r", "30", *venc(), "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", out)
     kept = sum(b - a for a, b in keep)
-    with open(os.path.join(wd, "roughcut_report.md"), "w") as f:
+    with open(os.path.join(wd, "roughcut_report.md"), "w", encoding="utf-8") as f:
         f.write(f"# {cfg['id']} 粗剪\n\n{DUR:.1f}s -> {kept:.1f}s，共 {len(m)} 处剪切\n\n")
         for a, b, r in m:
             if not r.startswith("停顿"):
@@ -190,7 +235,7 @@ def build(wd, cfg):
             else: runs.append([ch, s])
         return [tuple(r) for r in runs]
 
-    with open(os.path.join(wd, "cues.txt"), "w") as f:
+    with open(os.path.join(wd, "cues.txt"), "w", encoding="utf-8") as f:
         for i, c in enumerate(CUES):
             f.write("%d\t%.2f-%.2f\t%s\n" % (i, c[0], c[1], "".join(r[0] if r[1] != "X" else "■" * len(r[0]) for r in runs_for(c))))
     return CUES, runs_for, chars
@@ -214,7 +259,7 @@ def cmd_beep(wd):
     cfg = load(wd); src = outp(cfg, "_粗剪.mp4"); out = outp(cfg, "_粗剪_哔.mp4")
     beeps = cfg.get("beeps", [])
     if not beeps:
-        sh("cp", src, out); print(out, "(no beeps)"); return
+        shutil.copyfile(src, out); print(out, "(no beeps)"); return
     R = "+".join(f"between(t,{a},{b})" for a, b, _ in beeps)
     sh("ffmpeg", "-y", "-v", "error", "-i", src, "-f", "lavfi", "-i", f"sine=f=1000:sample_rate=44100:d={duration(src) + 1}",
        "-filter_complex", f"[0:a]volume='if({R},0,1)':eval=frame[m];[1:a]volume=0.25,volume='if({R},1,0)':eval=frame,"
@@ -228,7 +273,7 @@ def overlays(wd, cfg, en_on):
     CUES, runs_for, _ = build(wd, cfg)
     EN = None
     if en_on:
-        EN = json.load(open(os.path.join(wd, "en.json")))
+        EN = json.load(open(os.path.join(wd, "en.json"), encoding="utf-8"))
         assert len(EN) == len(CUES), f"en.json has {len(EN)} lines, cues.txt has {len(CUES)}"
     LISTS = [(l["items"], l["reveal"], l["end"]) for l in cfg.get("lists", [])]
 
@@ -277,10 +322,11 @@ def overlays(wd, cfg, en_on):
             p = os.path.join(OUT, f"{len(cache):04d}.png"); img.save(p); cache[key] = p
         seq.append((cache[key], a, b))
     lst = os.path.join(wd, "ov_en.txt" if EN else "ov.txt")
-    with open(lst, "w") as f:
+    with open(lst, "w", encoding="utf-8") as f:
         f.write("ffconcat version 1.0\n")
-        for p, a, b in seq: f.write(f"file '{p}'\nduration {b - a:.3f}\n")
-        f.write(f"file '{seq[-1][0]}'\n")
+        posix = lambda p: p.replace(os.sep, "/")
+        for p, a, b in seq: f.write(f"file '{posix(p)}'\nduration {b - a:.3f}\n")
+        f.write(f"file '{posix(seq[-1][0])}'\n")
     return seq, lst
 
 
@@ -310,7 +356,7 @@ def cmd_burn(wd, *flags):
     out = outp(cfg, "_成片_双语.mp4" if en else "_成片.mp4")
     sh("ffmpeg", "-y", "-v", "error", "-i", src, "-f", "concat", "-safe", "0", "-i", lst, "-filter_complex",
        f"[1:v]fps=30,format=rgba,scale={S.W}:{S.H}[o];[0:v][o]overlay=0:0:eof_action=pass:format=auto,format=yuv420p[v]",
-       "-map", "[v]", "-map", "0:a", "-c:v", "h264_videotoolbox", "-b:v", "14M", "-c:a", "copy", "-movflags", "+faststart", out)
+       "-map", "[v]", "-map", "0:a", *venc(), "-c:a", "copy", "-movflags", "+faststart", out)
     print(out)
 
 

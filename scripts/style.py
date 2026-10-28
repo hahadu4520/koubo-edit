@@ -4,7 +4,11 @@ from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
 FONTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "fonts")
 
-SUBF = ("/System/Library/Fonts/Hiragino Sans GB.ttc", 2)  # 冬青黑体 W6
+# 字幕黑体：Mac 冬青黑体 W6 → Windows 微软雅黑 Bold → Linux 思源黑体
+SUBF = next(((p, i) for p, i in [("/System/Library/Fonts/Hiragino Sans GB.ttc", 2),
+                                 (os.path.join(os.environ.get("WINDIR", "C:/Windows"), "Fonts", "msyhbd.ttc"), 0),
+                                 ("/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc", 2)] if os.path.exists(p)),
+            ("/System/Library/Fonts/Hiragino Sans GB.ttc", 2))
 W, H = 1088, 1920
 Y = "#FFD400"; R = "#FF3B30"; CY = "#4FD1FF"; WH = "#FFFFFF"; BK = "#000000"
 BASE, SHEAR = 68, 0.22
