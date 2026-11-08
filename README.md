@@ -1,5 +1,7 @@
 # 口播剪辑技能（koubo-edit）
 
+> **这个技能已并入 [hahadu4520/edit-skills](https://github.com/hahadu4520/edit-skills)**（hahadu 剪辑技能合集，还有像素风剪辑等其他风格）。新同学请从那里安装；已经从本仓库装过的照常使用，不用重装。
+
 让 Claude Code、Codex 等 AI Agent 帮你剪竖屏口播视频：
 
 - 粗剪：去掉停顿、口误和重复。
